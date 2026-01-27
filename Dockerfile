@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y \
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY schemas ./schemas
+COPY examples ./examples
 COPY hem-lambda ./hem-lambda
 COPY hem-http ./hem-http
 
