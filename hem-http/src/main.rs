@@ -20,15 +20,13 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
-// Embed the UK weather file at compile time
-// This is the London Gatwick weather file - good default for SE England
-const WEATHER_DATA: &str = include_str!("../weather/GBR_ENG_London.Gatwick.AP.037760_TMYx.2007-2021.epw");
-
 #[derive(Debug, Deserialize)]
 struct CalculateRequest {
     input: Value,
     #[serde(default)]
-    region: Option<String>,
+    weather_data: Option<String>,
+    #[serde(default)]
+    wrapper: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -84,8 +82,21 @@ async fn calculate(Json(payload): Json<CalculateRequest>) -> impl IntoResponse {
 
     let output = HttpOutput::new();
 
-    // Parse weather data
-    let external_conditions = weather_data_to_vec(BufReader::new(Cursor::new(WEATHER_DATA))).ok();
+    // Parse weather data if provided
+    let external_conditions = match &payload.weather_data {
+        Some(weather_str) => {
+            weather_data_to_vec(BufReader::new(Cursor::new(weather_str.as_bytes()))).ok()
+        }
+        None => None,
+    };
+
+    // Determine project flags based on wrapper parameter
+    let flags = match payload.wrapper.as_deref() {
+        Some("fhs") => ProjectFlags::FHS_ASSUMPTIONS,
+        Some("fhs_fee") => ProjectFlags::FHS_FEE_ASSUMPTIONS,
+        Some("fhs_compliance") => ProjectFlags::FHS_COMPLIANCE,
+        _ => ProjectFlags::empty(),
+    };
 
     // Run the HEM calculation
     match run_project(
@@ -93,10 +104,108 @@ async fn calculate(Json(payload): Json<CalculateRequest>) -> impl IntoResponse {
         &output,
         external_conditions,
         None,
-        &ProjectFlags::empty(),
+        &flags,
     ) {
         Ok(Some(result)) => {
-            // Convert HemResponse to JSON Value for the response
+            let json_value = serde_json::to_value(&result).unwrap_or(json!({}));
+            (
+                StatusCode::OK,
+                Json(CalculateResponse {
+                    success: true,
+                    data: Some(json_value),
+                    output: None,
+                    errors: None,
+                }),
+            )
+        }
+        Ok(None) => {
+            let output_string = Arc::try_unwrap(output.0).unwrap().into_inner();
+            (
+                StatusCode::OK,
+                Json(CalculateResponse {
+                    success: true,
+                    data: None,
+                    output: Some(output_string),
+                    errors: None,
+                }),
+            )
+        }
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(CalculateResponse {
+                success: false,
+                data: None,
+                output: None,
+                errors: Some(vec![ErrorDetail {
+                    id: Uuid::new_v4().to_string(),
+                    status: "422".to_string(),
+                    detail: e.to_string(),
+                }]),
+            }),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FhsCalculateRequest {
+    input: Value,
+    #[serde(default)]
+    weather_data: Option<String>,
+}
+
+async fn calculate_fhs(Json(payload): Json<FhsCalculateRequest>) -> impl IntoResponse {
+    run_with_flags(payload.input, payload.weather_data, ProjectFlags::FHS_ASSUMPTIONS).await
+}
+
+async fn calculate_fhs_fee(Json(payload): Json<FhsCalculateRequest>) -> impl IntoResponse {
+    run_with_flags(payload.input, payload.weather_data, ProjectFlags::FHS_FEE_ASSUMPTIONS).await
+}
+
+async fn calculate_fhs_compliance(Json(payload): Json<FhsCalculateRequest>) -> impl IntoResponse {
+    run_with_flags(payload.input, payload.weather_data, ProjectFlags::FHS_COMPLIANCE).await
+}
+
+async fn run_with_flags(
+    input: Value,
+    weather_data: Option<String>,
+    flags: ProjectFlags,
+) -> (StatusCode, Json<CalculateResponse>) {
+    let input_json = match serde_json::to_string(&input) {
+        Ok(json) => json,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(CalculateResponse {
+                    success: false,
+                    data: None,
+                    output: None,
+                    errors: Some(vec![ErrorDetail {
+                        id: Uuid::new_v4().to_string(),
+                        status: "400".to_string(),
+                        detail: format!("Invalid input JSON: {}", e),
+                    }]),
+                }),
+            );
+        }
+    };
+
+    let output = HttpOutput::new();
+
+    let external_conditions = match &weather_data {
+        Some(weather_str) => {
+            weather_data_to_vec(BufReader::new(Cursor::new(weather_str.as_bytes()))).ok()
+        }
+        None => None,
+    };
+
+    match run_project(
+        input_json.as_bytes(),
+        &output,
+        external_conditions,
+        None,
+        &flags,
+    ) {
+        Ok(Some(result)) => {
             let json_value = serde_json::to_value(&result).unwrap_or(json!({}));
             (
                 StatusCode::OK,
@@ -138,7 +247,6 @@ async fn calculate(Json(payload): Json<CalculateRequest>) -> impl IntoResponse {
 
 #[tokio::main]
 async fn main() {
-    // Initialize tracing
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -147,10 +255,12 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // Build the router
     let app = Router::new()
         .route("/health", get(health))
         .route("/calculate", post(calculate))
+        .route("/calculate-fhs", post(calculate_fhs))
+        .route("/calculate-fhs-fee", post(calculate_fhs_fee))
+        .route("/calculate-fhs-compliance", post(calculate_fhs_compliance))
         .layer(TraceLayer::new_for_http())
         .layer(
             CorsLayer::new()
@@ -159,7 +269,6 @@ async fn main() {
                 .allow_headers(Any),
         );
 
-    // Get port from environment or default to 8080
     let port: u16 = std::env::var("PORT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -172,7 +281,6 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-/// Output handler for HTTP responses (mirrors the Lambda pattern)
 #[derive(Debug)]
 struct HttpOutput(Arc<Mutex<String>>);
 
