@@ -27,6 +27,20 @@ struct CalculateRequest {
     weather_data: Option<String>,
     #[serde(default)]
     wrapper: Option<String>,
+    /// Optional custom tariff price CSV (same format as the baked-in
+    /// examples/tariff_data CSV). When present, battery grid-charge dispatch
+    /// prices against this data instead of the bundled 2024 sample.
+    #[serde(default)]
+    tariff_data: Option<String>,
+}
+
+/// Write tariff CSV data to a temp file and return its path. The engine's
+/// tariff loader takes a file path, so HTTP-supplied CSV content is staged
+/// on disk for the duration of the run.
+fn stage_tariff_file(tariff_data: &str) -> io::Result<std::path::PathBuf> {
+    let path = std::env::temp_dir().join(format!("tariff-{}.csv", Uuid::new_v4()));
+    std::fs::write(&path, tariff_data)?;
+    Ok(path)
 }
 
 #[derive(Debug, Serialize)]
@@ -98,14 +112,44 @@ async fn calculate(Json(payload): Json<CalculateRequest>) -> impl IntoResponse {
         _ => ProjectFlags::empty(),
     };
 
+    // Stage custom tariff data (if provided) as a temp file for the engine
+    let tariff_file = match payload.tariff_data.as_deref() {
+        Some(csv) => match stage_tariff_file(csv) {
+            Ok(path) => Some(path),
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(CalculateResponse {
+                        success: false,
+                        data: None,
+                        output: None,
+                        errors: Some(vec![ErrorDetail {
+                            id: Uuid::new_v4().to_string(),
+                            status: "500".to_string(),
+                            detail: format!("Could not stage tariff data: {}", e),
+                        }]),
+                    }),
+                );
+            }
+        },
+        None => None,
+    };
+    let tariff_file_path = tariff_file.as_ref().and_then(|p| p.to_str());
+
     // Run the HEM calculation
-    match run_project(
+    let run_result = run_project(
         input_json.as_bytes(),
         &output,
         external_conditions,
-        None,
+        tariff_file_path,
         &flags,
-    ) {
+    );
+
+    if let Some(path) = &tariff_file {
+        let _ = std::fs::remove_file(path);
+    }
+
+    match run_result {
         Ok(Some(result)) => {
             let json_value = serde_json::to_value(&result).unwrap_or(json!({}));
             (
