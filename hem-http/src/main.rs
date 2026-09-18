@@ -1,5 +1,5 @@
 use axum::{
-    extract::Json,
+    extract::{DefaultBodyLimit, Json},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -305,6 +305,7 @@ async fn main() {
         .route("/calculate-fhs", post(calculate_fhs))
         .route("/calculate-fhs-fee", post(calculate_fhs_fee))
         .route("/calculate-fhs-compliance", post(calculate_fhs_compliance))
+        .layer(DefaultBodyLimit::max(10 * 1024 * 1024))         
         .layer(TraceLayer::new_for_http())
         .layer(
             CorsLayer::new()
