@@ -999,7 +999,10 @@ impl StorageTank {
             // TODO (from Python code) - find in standard - availability of back-up - where is this from?
             // also referred to as electrical power on
             let sto_bu_on = 1.;
-            min_of_2(q_x_in_adj - energy_surplus, q_x_in_adj * sto_bu_on)
+            max_of_2(
+                0.,
+                min_of_2(q_x_in_adj - energy_surplus, q_x_in_adj * sto_bu_on),
+            )
         } else {
             0.
         };
@@ -4295,6 +4298,39 @@ mod tests {
                 ]
             }
         )
+    }
+
+    #[rstest]
+    #[case([10., 20., 30., 40.], [0., 0., 0.5, 0.], 0.5)]
+    #[case([10., 20., 60., 70.], [0., 0., 0.1, 0.], 0.)]
+    fn test_calc_final_temps_never_requests_negative_heat(
+        storage_tank1: (StorageTank, Arc<RwLock<EnergySupply>>),
+        simulation_time_for_storage_tank: SimulationTime,
+        #[case] temp_s3_n: [f64; 4],
+        #[case] q_x_in_n: [f64; 4],
+        #[case] expected_heat_demand: f64,
+    ) {
+        let (storage_tank1, _) = storage_tank1;
+        let heat_source = storage_tank1.heat_source_data["imheater"]
+            .clone()
+            .heat_source;
+        let result = storage_tank1
+            .calc_final_temps(
+                &temp_s3_n,
+                &heat_source.lock(),
+                q_x_in_n.to_vec(),
+                2,
+                &[0.; 4],
+                simulation_time_for_storage_tank.iter().current_iteration(),
+                None,
+            )
+            .unwrap();
+
+        assert_relative_eq!(result.q_in_h_w, expected_heat_demand);
+        assert_relative_eq!(
+            storage_tank1.energy_demand_test.load(Ordering::SeqCst),
+            expected_heat_demand
+        );
     }
 
     #[rstest]
